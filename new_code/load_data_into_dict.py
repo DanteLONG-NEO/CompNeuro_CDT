@@ -195,17 +195,23 @@ def bandpower_hilbert(
 # NWB modality loaders
 # -----------------------
 def load_lfp_container(nwbfile, which: str, max_samples: Optional[int] = None):
-    obj = nwbfile.processing["ecephys"][which]
+    ece = nwbfile.processing["ecephys"]
+    if hasattr(ece, "data_interfaces") and which in ece.data_interfaces:
+        lfp_interface = ece.data_interfaces[which]
+    else:
+        lfp_interface = ece[which]
 
-    # robust pick
-    key = _pick_first_series(obj.electrical_series, prefer=["ElectricalSeries", "LFP"])
-    ts = obj.electrical_series[key]
+    series_key = _pick_first_series(
+        lfp_interface.electrical_series,
+        prefer=["ElectricalSeries", "LFP"]
+    )
+    ts = lfp_interface.electrical_series[series_key]
 
     lfp, t, fs = get_ts_data_and_time(ts, max_samples=max_samples)
     lfp = np.asarray(lfp)
     if lfp.ndim == 1:
         lfp = lfp[:, None]
-    return lfp.astype(np.float32), t, fs
+    return lfp.astype(np.float32), np.asarray(t, dtype=np.float64), fs
 
 
 def load_eye_gaze_and_pupil(nwbfile, max_samples: Optional[int] = None):
@@ -309,7 +315,12 @@ def load_multimodal_subjects(
     bands: Optional[Dict[str, Tuple[float, float]]] = None,
     load_fmri: bool = False,
     fmri_max_runs: Optional[int] = None,
+    verbose: bool = True,
+    **kwargs,   # <-- 兼容多余参数，避免 TypeError
 ) -> Dict[int, Dict[str, Any]]:
+
+    if kwargs and verbose:
+        print(f"[WARN] load_multimodal_subjects ignored kwargs: {sorted(kwargs.keys())}")
 
     if bands is None:
         bands = {
@@ -338,22 +349,61 @@ def load_multimodal_subjects(
             io = NWBHDF5IO(str(nwb_path), "r", load_namespaces=True)
             nwbfile = io.read()
 
-            # ---- time grid ----
-            if use_movie_time_as_grid:
-                t_grid = load_movie_time(nwbfile, max_samples=max_nwb_samples)
+            # -----------------------------
+            # 1) 先读 LFP（拿到原始时间轴）
+            # -----------------------------
+            lfp_macro, t_macro, fs_macro = load_lfp_container(
+                nwbfile, "LFP_macro", max_samples=max_nwb_samples
+            )
+            lfp_micro, t_micro, fs_micro = load_lfp_container(
+                nwbfile, "LFP_micro", max_samples=max_nwb_samples
+            )
+
+            if verbose:
+                print(f"[sub {sub}] nwb_path={nwb_path}")
+                print(f"[sub {sub}] lfp_macro shape={lfp_macro.shape} dtype={lfp_macro.dtype}")
+                print(f"[sub {sub}] t_macro len={len(t_macro)} range=({t_macro[0]:.3f}, {t_macro[-1]:.3f}) fs={fs_macro}")
+                print(f"[sub {sub}] lfp_macro min/max=({float(np.min(lfp_macro)):.3f}, {float(np.max(lfp_macro)):.3f})")
+
+            # -----------------------------
+            # 2) 决定公共时间网格 t_grid
+            #    - 你现在要“先观测原始数据”
+            #    - resample_lfp=False => t_grid = t_macro（完整 LFP 采样）
+            # -----------------------------
+            movie_time = None
+            movie_time_error = None
+
+            if not resample_lfp:
+                t_grid = t_macro
             else:
-                if grid_dt is None:
-                    raise ValueError("If use_movie_time_as_grid=False you must provide grid_dt.")
-                lfp_macro_tmp, t_macro_tmp, fs_macro_tmp = load_lfp_container(
-                    nwbfile, "LFP_macro", max_samples=max_nwb_samples
-                )
-                t0, t1 = float(t_macro_tmp[0]), float(t_macro_tmp[-1])
-                t_grid = np.arange(t0, t1, float(grid_dt), dtype=np.float64)
+                if use_movie_time_as_grid:
+                    # 用 movie frame time 作为网格（会很稀疏，仅在你明确要这样时用）
+                    t_grid = load_movie_time(nwbfile, max_samples=max_nwb_samples)
+                else:
+                    if grid_dt is None:
+                        raise ValueError("If use_movie_time_as_grid=False you must provide grid_dt.")
+                    t0, t1 = float(t_macro[0]), float(t_macro[-1])
+                    t_grid = np.arange(t0, t1, float(grid_dt), dtype=np.float64)
 
-            # ---- LFP macro/micro ----
-            lfp_macro, t_macro, fs_macro = load_lfp_container(nwbfile, "LFP_macro", max_samples=max_nwb_samples)
-            lfp_micro, t_micro, fs_micro = load_lfp_container(nwbfile, "LFP_micro", max_samples=max_nwb_samples)
+            # movie_time 单独读出来（用于对齐/标注事件），不再用于强制重采样
+            if use_movie_time_as_grid:
+                try:
+                    movie_time = load_movie_time(nwbfile, max_samples=max_nwb_samples)
+                except Exception as e:
+                    movie_time_error = repr(e)
+                    movie_time = None
 
+            if verbose:
+                print(f"[sub {sub}] resample_lfp={resample_lfp} -> t_grid len={len(t_grid)} "
+                      f"(expect == len(t_macro) when resample_lfp=False)")
+                if movie_time is not None:
+                    print(f"[sub {sub}] movie_time len={len(movie_time)} range=({movie_time[0]:.3f}, {movie_time[-1]:.3f})")
+                else:
+                    print(f"[sub {sub}] movie_time=None ({movie_time_error})")
+
+            # -----------------------------
+            # 3) LFP 是否重采样
+            # -----------------------------
             if resample_lfp:
                 lfp_macro_rs = resample_continuous(lfp_macro, t_macro, t_grid)
                 lfp_micro_rs = resample_continuous(lfp_micro, t_micro, t_grid)
@@ -361,7 +411,9 @@ def load_multimodal_subjects(
                 lfp_macro_rs = lfp_macro
                 lfp_micro_rs = lfp_micro
 
-            # ---- Eye + pupil ----
+            # -----------------------------
+            # 4) Eye + pupil（如果你只看 LFP，可之后再关掉）
+            # -----------------------------
             gaze, pupil, t_eye = load_eye_gaze_and_pupil(nwbfile, max_samples=max_nwb_samples)
 
             gaze_rs = None
@@ -374,17 +426,24 @@ def load_multimodal_subjects(
             if pupil is not None and t_eye is not None:
                 pupil_rs = resample_continuous(pupil, t_eye, t_grid).astype(np.float32).squeeze()
 
-            # ---- Spikes ----
-            spikes_list = load_spikes_units(nwbfile)  # list of spike times (sec)
+            # -----------------------------
+            # 5) Spikes -> firing rate（t_grid 很密时会很稀疏，但能跑）
+            # -----------------------------
+            spikes_list = load_spikes_units(nwbfile)
             firing_rate = spikes_to_firing_rate(spikes_list, t_grid) if compute_firing_rate else None
 
-            # ---- Band power ----
+            # -----------------------------
+            # 6) LFP band power（注意：如果你 resample 且 grid_dt 改了，fs 也要跟着变）
+            # -----------------------------
             lfp_bandpower: Dict[str, np.ndarray] = {}
             if compute_lfp_bandpower:
+                fs_for_bp = fs_macro if (not resample_lfp or grid_dt is None) else (1.0 / float(grid_dt))
                 for name, band in bands.items():
-                    lfp_bandpower[name] = bandpower_hilbert(lfp_macro_rs, fs=fs_macro, band=band)
+                    lfp_bandpower[name] = bandpower_hilbert(lfp_macro_rs, fs=fs_for_bp, band=band)
 
-            # ---- fMRI ----
+            # -----------------------------
+            # 7) fMRI（可选）
+            # -----------------------------
             bold_list: List[np.ndarray] = []
             fmri_error = None
             if load_fmri:
@@ -394,6 +453,9 @@ def load_multimodal_subjects(
                     fmri_error = repr(e)
                     bold_list = []
 
+            # -----------------------------
+            # 8) 输出
+            # -----------------------------
             out[sub] = {
                 "spikes": spikes_list,
                 "firing_rate": firing_rate,
@@ -402,7 +464,8 @@ def load_multimodal_subjects(
                 "lfp_bandpower": lfp_bandpower,
                 "eye_gaze": gaze_rs,
                 "pupil": pupil_rs,
-                "movie_time": t_grid.astype(np.float64),
+                "time_grid": np.asarray(t_grid, dtype=np.float64),  # <-- 真实公共时间轴
+                "movie_time": None if movie_time is None else np.asarray(movie_time, dtype=np.float64),
                 "bold": bold_list,
                 "meta": {
                     "sub": sub,
@@ -413,10 +476,11 @@ def load_multimodal_subjects(
                     "fs_micro": fs_micro,
                     "n_units": len(spikes_list),
                     "fmri_error": fmri_error,
+                    "movie_time_error": movie_time_error,
+                    "resample_lfp": resample_lfp,
+                    "max_nwb_samples": max_nwb_samples,
                 },
             }
-
-
 
         except Exception as e:
             out[sub] = {
@@ -426,7 +490,7 @@ def load_multimodal_subjects(
                     "nwb_sub": nwb_sub,
                     "nwb_path": str(nwb_path) if nwb_path else None,
                     "error": repr(e),
-                    "traceback": traceback.format_exc(),  # <- 加这个
+                    "traceback": traceback.format_exc(),
                 }
             }
 
