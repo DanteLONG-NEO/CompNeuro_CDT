@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bmovie"
+version = "0.1.0"
+description = "Tools for Bmovie NWB/BIDS dataset analysis"
+authors = [
+    {name="Dante"}
+]
+
+dependencies = [
+    "pynwb",
+    "numpy",
+    "pandas",
+    "nibabel",
+]
+
+[tool.setuptools.packages.find]
+include = ["bmovie_code*", "new_code*"]
