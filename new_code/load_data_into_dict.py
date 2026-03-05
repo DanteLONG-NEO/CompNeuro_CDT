@@ -301,6 +301,7 @@ def load_multimodal_subjects(
     bids_root: Union[str, Path],
     *,
     max_nwb_samples: Optional[int] = None,
+    resample_lfp: bool = False,
     use_movie_time_as_grid: bool = True,
     grid_dt: Optional[float] = None,
     compute_firing_rate: bool = True,
@@ -353,8 +354,12 @@ def load_multimodal_subjects(
             lfp_macro, t_macro, fs_macro = load_lfp_container(nwbfile, "LFP_macro", max_samples=max_nwb_samples)
             lfp_micro, t_micro, fs_micro = load_lfp_container(nwbfile, "LFP_micro", max_samples=max_nwb_samples)
 
-            lfp_macro_rs = resample_continuous(lfp_macro, t_macro, t_grid)
-            lfp_micro_rs = resample_continuous(lfp_micro, t_micro, t_grid)
+            if resample_lfp:
+                lfp_macro_rs = resample_continuous(lfp_macro, t_macro, t_grid)
+                lfp_micro_rs = resample_continuous(lfp_micro, t_micro, t_grid)
+            else:
+                lfp_macro_rs = lfp_macro
+                lfp_micro_rs = lfp_micro
 
             # ---- Eye + pupil ----
             gaze, pupil, t_eye = load_eye_gaze_and_pupil(nwbfile, max_samples=max_nwb_samples)
