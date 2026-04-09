@@ -1,4 +1,6 @@
 import numpy as np
+import pandas as pd
+from typing import Dict, List, Optional, Any
 
 def make_lagged_matrix(X, lags):
     """
@@ -23,3 +25,839 @@ def make_lagged_matrix(X, lags):
         mats.append(Xs)
 
     return np.concatenate(mats, axis=1)
+
+
+# =========================
+# 1. 一些基础工具函数
+# =========================
+
+def _as_2d(x):
+    """
+    Convert input to 2D array:
+    - [T] -> [T, 1]
+    - [T, D] -> [T, D]
+    """
+    x = np.asarray(x)
+    if x.ndim == 1:
+        x = x[:, None]
+    return x
+
+
+def _safe_mean_std(x, axis=0, eps=1e-8):
+    mu = np.nanmean(x, axis=axis)
+    sd = np.nanstd(x, axis=axis)
+    sd = np.where(sd < eps, 1.0, sd)
+    return mu, sd
+
+
+def _find_baseline_mask(t, baseline_start=-10.0, baseline_end=0.0):
+    t = np.asarray(t, dtype=float)
+    return (t >= baseline_start) & (t < baseline_end)
+
+
+def _find_window_mask(t, start, end, right_inclusive=False):
+    t = np.asarray(t, dtype=float)
+    if right_inclusive:
+        return (t >= start) & (t <= end)
+    return (t >= start) & (t < end)
+
+
+def _normalize_by_baseline(
+    X: np.ndarray,
+    baseline_X: np.ndarray,
+    mode: Optional[str] = "zscore"
+):
+    """
+    X: [T, D]
+    baseline_X: [Tb, D]
+    mode:
+        - None / 'none': no normalization
+        - 'zscore': (X - mu) / sd
+        - 'center': X - mu
+        - 'ratio': X / mu
+        - 'percent_change': (X - mu) / |mu|
+    """
+    if mode is None or mode == "none":
+        return X
+
+    X = np.asarray(X, dtype=float)
+    baseline_X = np.asarray(baseline_X, dtype=float)
+
+    mu, sd = _safe_mean_std(baseline_X, axis=0)
+
+    if mode == "zscore":
+        return (X - mu) / sd
+    elif mode == "center":
+        return X - mu
+    elif mode == "ratio":
+        denom = np.where(np.abs(mu) < 1e-8, 1.0, mu)
+        return X / denom
+    elif mode == "percent_change":
+        denom = np.where(np.abs(mu) < 1e-8, 1.0, np.abs(mu))
+        return (X - mu) / denom
+    else:
+        raise ValueError(f"Unknown baseline normalization mode: {mode}")
+
+
+def _infer_emotion_cols(df_face_note: pd.DataFrame) -> List[str]:
+    emo_cols = [c for c in df_face_note.columns if c.startswith("emo_")]
+    if len(emo_cols) == 0:
+        raise ValueError("No emotion columns found. Expected columns like 'emo_neutral', 'emo_happy', ...")
+    return emo_cols
+
+
+def _check_required_face_cols(df_face_note: pd.DataFrame):
+    required = ["movie_time"]
+    for c in required:
+        if c not in df_face_note.columns:
+            raise ValueError(f"df_face_note missing required column: {c}")
+
+
+# =========================
+# 2. face label -> soft label window
+# =========================
+
+def build_face_soft_labels_for_windows(
+    df_face_note: pd.DataFrame,
+    window_starts: np.ndarray,
+    window_size_sec: float,
+    use_only_valid_face_frames: bool = True,
+    valid_face_mode: str = "front_or_face",
+    include_aux_labels: bool = True,
+) -> pd.DataFrame:
+    """
+    根据窗口起点生成 soft labels。
+
+    Parameters
+    ----------
+    df_face_note : DataFrame
+        必须至少包含:
+        - movie_time
+        - emo_* columns
+        可选:
+        - n_faces
+        - any_front_face
+        - Jacky_present
+
+    window_starts : array-like
+        每个窗口的起点（秒）
+
+    window_size_sec : float
+        窗口长度（秒）
+
+    use_only_valid_face_frames : bool
+        是否只在“有效脸帧”上统计 emotion 占比
+
+    valid_face_mode : str
+        如何定义有效脸帧:
+        - 'front_or_face': (n_faces > 0) OR (any_front_face == 1)
+        - 'front_and_face': (n_faces > 0) AND (any_front_face == 1)
+        - 'front_only': any_front_face == 1
+        - 'face_only': n_faces > 0
+        - 'all': 所有帧都算
+
+    include_aux_labels : bool
+        是否额外输出一些窗口统计:
+        - valid_face_ratio
+        - front_face_ratio
+        - jacky_ratio
+        - mean_n_faces
+    """
+    _check_required_face_cols(df_face_note)
+    emo_cols = _infer_emotion_cols(df_face_note)
+
+    df = df_face_note.copy().sort_values("movie_time").reset_index(drop=True)
+    t_face = df["movie_time"].to_numpy(dtype=float)
+
+    has_n_faces = "n_faces" in df.columns
+    has_front = "any_front_face" in df.columns
+    has_jacky = "Jacky_present" in df.columns
+
+    if has_n_faces:
+        n_faces = df["n_faces"].to_numpy(dtype=float)
+    else:
+        n_faces = np.zeros(len(df), dtype=float)
+
+    if has_front:
+        any_front = df["any_front_face"].astype(int).to_numpy()
+    else:
+        any_front = np.zeros(len(df), dtype=int)
+
+    if has_jacky:
+        jacky = df["Jacky_present"].astype(int).to_numpy()
+    else:
+        jacky = np.zeros(len(df), dtype=int)
+
+    emo_mat = df[emo_cols].astype(float).to_numpy()  # [Nf, K]
+
+    # 定义有效脸帧
+    if valid_face_mode == "front_or_face":
+        valid_face = ((n_faces > 0) | (any_front == 1))
+    elif valid_face_mode == "front_and_face":
+        valid_face = ((n_faces > 0) & (any_front == 1))
+    elif valid_face_mode == "front_only":
+        valid_face = (any_front == 1)
+    elif valid_face_mode == "face_only":
+        valid_face = (n_faces > 0)
+    elif valid_face_mode == "all":
+        valid_face = np.ones(len(df), dtype=bool)
+    else:
+        raise ValueError(f"Unknown valid_face_mode: {valid_face_mode}")
+
+    rows = []
+
+    for ws in window_starts:
+        we = ws + window_size_sec
+        m = _find_window_mask(t_face, ws, we, right_inclusive=False)
+
+        row = {
+            "window_start": ws,
+            "window_end": we,
+            "n_face_frames_total": int(m.sum()),
+        }
+
+        if m.sum() == 0:
+            # 没覆盖到任何 face annotation frame
+            for c in emo_cols:
+                row[c] = np.nan
+            row["p_non_neutral"] = np.nan
+            row["hard_label"] = None
+
+            if include_aux_labels:
+                row["valid_face_ratio"] = np.nan
+                row["front_face_ratio"] = np.nan
+                row["jacky_ratio"] = np.nan
+                row["mean_n_faces"] = np.nan
+
+            rows.append(row)
+            continue
+
+        valid_m = m & valid_face if use_only_valid_face_frames else m
+        n_valid = int(valid_m.sum())
+
+        if n_valid == 0:
+            # 窗口里有 frame，但没有有效脸
+            for c in emo_cols:
+                row[c] = 0.0
+            row["p_non_neutral"] = 0.0
+            row["hard_label"] = "no_valid_face"
+
+            if include_aux_labels:
+                row["valid_face_ratio"] = 0.0
+                row["front_face_ratio"] = float(any_front[m].mean()) if m.sum() > 0 else np.nan
+                row["jacky_ratio"] = float(jacky[m].mean()) if m.sum() > 0 else np.nan
+                row["mean_n_faces"] = float(n_faces[m].mean()) if m.sum() > 0 else np.nan
+
+            rows.append(row)
+            continue
+
+        emo_prob = emo_mat[valid_m].mean(axis=0)
+
+        for i, c in enumerate(emo_cols):
+            row[c] = float(emo_prob[i])
+
+        if "emo_neutral" in emo_cols:
+            row["p_non_neutral"] = float(1.0 - row["emo_neutral"])
+        else:
+            row["p_non_neutral"] = np.nan
+
+        row["hard_label"] = emo_cols[int(np.nanargmax(emo_prob))]
+
+        if include_aux_labels:
+            row["valid_face_ratio"] = float(valid_m.sum() / m.sum()) if m.sum() > 0 else np.nan
+            row["front_face_ratio"] = float(any_front[m].mean()) if m.sum() > 0 else np.nan
+            row["jacky_ratio"] = float(jacky[m].mean()) if m.sum() > 0 else np.nan
+            row["mean_n_faces"] = float(n_faces[m].mean()) if m.sum() > 0 else np.nan
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# =========================
+# 3. 对单个模态做 baseline normalization
+# =========================
+
+def baseline_normalize_subject_modalities(
+    sub_dict: Dict[str, Any],
+    modality_keys: Optional[List[str]] = None,
+    baseline_time_key: str = "time_grid",
+    baseline_start: float = -10.0,
+    baseline_end: float = 0.0,
+    mode: Optional[str] = "zscore",
+) -> Dict[str, Any]:
+    """
+    对单个被试的各模态按 baseline 做归一化。
+    返回一个新的 sub_dict，不改原始数据。
+    """
+    new_sub = dict(sub_dict)
+
+    if modality_keys is None:
+        modality_keys = ["firing_rate", "lfp_macro", "lfp_micro", "lfp_bandpower", "eye_gaze", "pupil"]
+
+    if baseline_time_key not in sub_dict:
+        raise ValueError(f"sub_dict missing baseline_time_key: {baseline_time_key}")
+
+    t = np.asarray(sub_dict[baseline_time_key], dtype=float)
+    baseline_mask = _find_baseline_mask(t, baseline_start=baseline_start, baseline_end=baseline_end)
+
+    if baseline_mask.sum() == 0:
+        raise ValueError(
+            f"No baseline samples found in [{baseline_start}, {baseline_end}) "
+            f"using time key '{baseline_time_key}'."
+        )
+
+    for key in modality_keys:
+        if key not in sub_dict or sub_dict[key] is None:
+            continue
+
+        X = _as_2d(sub_dict[key]).astype(float)
+        if len(X) != len(t):
+            # 只处理和 time_grid 对齐的模态
+            continue
+
+        Xb = X[baseline_mask]
+        Xn = _normalize_by_baseline(X, Xb, mode=mode)
+
+        # 保持原来的维度风格
+        if np.asarray(sub_dict[key]).ndim == 1:
+            Xn = Xn[:, 0]
+
+        new_sub[key] = Xn
+
+    return new_sub
+
+
+# =========================
+# 4. 从单个被试生成窗口 neural sequence
+# =========================
+
+def extract_windowed_neural_sequences_for_subject(
+    sub_dict: Dict[str, Any],
+    window_size_sec: float = 0.5,
+    stride_sec: float = 0.1,
+    start_time: Optional[float] = 0.0,
+    end_time: Optional[float] = None,
+    remove_baseline_windows: bool = True,
+    modality_keys: Optional[List[str]] = None,
+    require_all_modalities_nonempty: bool = False,
+) -> Dict[str, Any]:
+    """
+    对单个被试，从 time_grid 上切窗口，直接截取每个窗口的原始序列，不做 summary。
+
+    Returns
+    -------
+    {
+        "window_df": DataFrame,
+        "sequences": {
+            modality_key: List[np.ndarray],   # 每个元素 shape [Tw, D]
+        }
+    }
+    """
+    if modality_keys is None:
+        modality_keys = ["firing_rate", "lfp_macro", "lfp_micro", "lfp_bandpower", "eye_gaze", "pupil"]
+
+    t_grid = np.asarray(sub_dict["time_grid"], dtype=float)
+
+    if end_time is None:
+        end_time = float(np.nanmax(t_grid))
+
+    if remove_baseline_windows and start_time is not None:
+        start_time = max(start_time, 0.0)
+
+    if start_time is None:
+        start_time = float(np.nanmin(t_grid))
+
+    # 窗口起点
+    # 确保窗口完整落在 [start_time, end_time]
+    last_start = end_time - window_size_sec
+    if last_start < start_time:
+        raise ValueError("No valid windows: end_time - window_size_sec < start_time")
+
+    window_starts = np.arange(start_time, last_start + 1e-12, stride_sec, dtype=float)
+
+    sequences = {k: [] for k in modality_keys}
+    rows = []
+
+    for ws in window_starts:
+        we = ws + window_size_sec
+        m = _find_window_mask(t_grid, ws, we, right_inclusive=False)
+
+        row = {
+            "window_start": float(ws),
+            "window_end": float(we),
+            "n_timepoints": int(m.sum()),
+        }
+
+        keep = True
+
+        for key in modality_keys:
+            if key not in sub_dict or sub_dict[key] is None:
+                seq = None
+            else:
+                X = _as_2d(sub_dict[key])
+                if len(X) != len(t_grid):
+                    seq = None
+                else:
+                    seq = X[m].copy()
+
+            sequences[key].append(seq)
+
+            if require_all_modalities_nonempty:
+                if seq is None or len(seq) == 0:
+                    keep = False
+
+        row["valid_window"] = bool(keep and m.sum() > 0)
+        rows.append(row)
+
+    window_df = pd.DataFrame(rows)
+
+    return {
+        "window_df": window_df,
+        "sequences": sequences,
+    }
+
+
+# =========================
+# 5. 单个被试：整合 soft label + neural sequence
+# =========================
+
+def build_subject_window_dataset(
+    sub_id: Any,
+    sub_dict: Dict[str, Any],
+    df_face_note: pd.DataFrame,
+    window_size_sec: float = 0.5,
+    stride_sec: float = 0.1,
+    start_time: Optional[float] = 0.0,
+    end_time: Optional[float] = None,
+    remove_baseline_windows: bool = True,
+    do_baseline_norm: bool = True,
+    baseline_mode: Optional[str] = "zscore",
+    baseline_start: float = -10.0,
+    baseline_end: float = 0.0,
+    modality_keys: Optional[List[str]] = None,
+    use_only_valid_face_frames: bool = True,
+    valid_face_mode: str = "front_or_face",
+    require_all_modalities_nonempty: bool = False,
+) -> Dict[str, Any]:
+    """
+    单个被试完整处理：
+    1) baseline normalization
+    2) 切 neural window sequence
+    3) 生 face soft label
+    4) merge 成一个窗口级 dataset
+    """
+    if modality_keys is None:
+        modality_keys = ["firing_rate", "lfp_macro", "lfp_micro", "lfp_bandpower", "eye_gaze", "pupil"]
+
+    # 1) baseline normalize
+    sub_proc = sub_dict
+    if do_baseline_norm:
+        sub_proc = baseline_normalize_subject_modalities(
+            sub_proc,
+            modality_keys=modality_keys,
+            baseline_time_key="time_grid",
+            baseline_start=baseline_start,
+            baseline_end=baseline_end,
+            mode=baseline_mode,
+        )
+
+    # 2) neural sequences
+    neural_pack = extract_windowed_neural_sequences_for_subject(
+        sub_proc,
+        window_size_sec=window_size_sec,
+        stride_sec=stride_sec,
+        start_time=start_time,
+        end_time=end_time,
+        remove_baseline_windows=remove_baseline_windows,
+        modality_keys=modality_keys,
+        require_all_modalities_nonempty=require_all_modalities_nonempty,
+    )
+
+    window_df = neural_pack["window_df"].copy()
+    window_starts = window_df["window_start"].to_numpy(dtype=float)
+
+    # 3) face soft labels
+    label_df = build_face_soft_labels_for_windows(
+        df_face_note=df_face_note,
+        window_starts=window_starts,
+        window_size_sec=window_size_sec,
+        use_only_valid_face_frames=use_only_valid_face_frames,
+        valid_face_mode=valid_face_mode,
+        include_aux_labels=True,
+    )
+
+    # 4) merge
+    merged_df = window_df.merge(
+        label_df,
+        on=["window_start", "window_end"],
+        how="left",
+        validate="one_to_one",
+    )
+    merged_df.insert(0, "sub", sub_id)
+
+    return {
+        "window_df": merged_df,
+        "sequences": neural_pack["sequences"],
+        "config": {
+            "window_size_sec": window_size_sec,
+            "stride_sec": stride_sec,
+            "start_time": start_time,
+            "end_time": end_time,
+            "remove_baseline_windows": remove_baseline_windows,
+            "do_baseline_norm": do_baseline_norm,
+            "baseline_mode": baseline_mode,
+            "baseline_start": baseline_start,
+            "baseline_end": baseline_end,
+            "modality_keys": modality_keys,
+            "use_only_valid_face_frames": use_only_valid_face_frames,
+            "valid_face_mode": valid_face_mode,
+            "require_all_modalities_nonempty": require_all_modalities_nonempty,
+        }
+    }
+
+
+# =========================
+# 6. 对所有被试 out[sub] 批量处理
+# =========================
+
+def build_all_subject_window_datasets(
+    out: Dict[Any, Dict[str, Any]],
+    df_face_note: pd.DataFrame,
+    window_size_sec: float = 0.5,
+    stride_sec: float = 0.1,
+    start_time: Optional[float] = 0.0,
+    end_time: Optional[float] = None,
+    remove_baseline_windows: bool = True,
+    do_baseline_norm: bool = True,
+    baseline_mode: Optional[str] = "zscore",
+    baseline_start: float = -10.0,
+    baseline_end: float = 0.0,
+    modality_keys: Optional[List[str]] = None,
+    use_only_valid_face_frames: bool = True,
+    valid_face_mode: str = "front_or_face",
+    require_all_modalities_nonempty: bool = False,
+    verbose: bool = True,
+) -> Dict[Any, Dict[str, Any]]:
+    """
+    对 out 里的所有 sub 做处理。
+    返回:
+        all_window_data[sub] = {
+            "window_df": ...,
+            "sequences": ...,
+            "config": ...
+        }
+    """
+    all_window_data = {}
+
+    for sub_id, sub_dict in out.items():
+        try:
+            if verbose:
+                print(f"[build] subject {sub_id}")
+
+            res = build_subject_window_dataset(
+                sub_id=sub_id,
+                sub_dict=sub_dict,
+                df_face_note=df_face_note,
+                window_size_sec=window_size_sec,
+                stride_sec=stride_sec,
+                start_time=start_time,
+                end_time=end_time,
+                remove_baseline_windows=remove_baseline_windows,
+                do_baseline_norm=do_baseline_norm,
+                baseline_mode=baseline_mode,
+                baseline_start=baseline_start,
+                baseline_end=baseline_end,
+                modality_keys=modality_keys,
+                use_only_valid_face_frames=use_only_valid_face_frames,
+                valid_face_mode=valid_face_mode,
+                require_all_modalities_nonempty=require_all_modalities_nonempty,
+            )
+            all_window_data[sub_id] = res
+
+            if verbose:
+                print(
+                    f"  -> n_windows = {len(res['window_df'])}, "
+                    f"valid_windows = {int(res['window_df']['valid_window'].sum())}"
+                )
+
+        except Exception as e:
+            print(f"[failed] subject {sub_id}: {repr(e)}")
+
+    return all_window_data
+
+
+# =========================
+# 7. 一个小工具：把某个模态的窗口序列pad成3D
+# =========================
+
+def pad_window_sequences(
+    seq_list: List[Optional[np.ndarray]],
+    pad_value: float = np.nan,
+) -> (np.ndarray, np.ndarray):
+    """
+    把 list of [Ti, D] pad 成 [N, Tmax, D]
+    返回:
+        X_pad: [N, Tmax, D]
+        mask : [N, Tmax]   (True=有效)
+    """
+    valid_seqs = [s for s in seq_list if s is not None and len(s) > 0]
+    if len(valid_seqs) == 0:
+        raise ValueError("No valid sequences to pad.")
+
+    D = valid_seqs[0].shape[1]
+    Tmax = max(s.shape[0] for s in valid_seqs)
+    N = len(seq_list)
+
+    X_pad = np.full((N, Tmax, D), pad_value, dtype=float)
+    mask = np.zeros((N, Tmax), dtype=bool)
+
+    for i, s in enumerate(seq_list):
+        if s is None or len(s) == 0:
+            continue
+        Ti = s.shape[0]
+        X_pad[i, :Ti, :] = s
+        mask[i, :Ti] = True
+
+    return X_pad, mask
+
+# =========================
+# filter and concat
+# =========================
+
+
+def filter_window_dataset(
+    subject_window_data: Dict[str, Any],
+    valid_window_only: bool = True,
+    min_valid_face_ratio: Optional[float] = None,
+    min_face_frames: Optional[int] = None,
+    min_non_neutral: Optional[float] = None,
+    allowed_hard_labels: Optional[List[str]] = None,
+    require_modalities_nonempty: Optional[List[str]] = None,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    对单个被试的 window dataset 做筛选。
+
+    Parameters
+    ----------
+    subject_window_data : dict
+        build_subject_window_dataset(...) 的输出，即:
+        {
+            "window_df": ...,
+            "sequences": {...},
+            "config": ...
+        }
+
+    valid_window_only : bool
+        是否只保留 window_df["valid_window"] == True 的窗口
+
+    min_valid_face_ratio : float or None
+        只保留 valid_face_ratio >= 该阈值 的窗口
+
+    min_face_frames : int or None
+        只保留 n_face_frames_total >= 该阈值 的窗口
+
+    min_non_neutral : float or None
+        只保留 p_non_neutral >= 该阈值 的窗口
+
+    allowed_hard_labels : list[str] or None
+        只保留 hard_label 在这个集合中的窗口
+
+    require_modalities_nonempty : list[str] or None
+        要求这些模态对应的 sequence 不能是 None 且长度 > 0
+
+    verbose : bool
+        是否打印筛选前后数量
+
+    Returns
+    -------
+    filtered_data : dict
+        结构与输入一致，但已经过滤过
+    """
+    df = subject_window_data["window_df"].copy().reset_index(drop=True)
+    seqs = subject_window_data["sequences"]
+    config = subject_window_data.get("config", {})
+
+    n0 = len(df)
+    keep = np.ones(n0, dtype=bool)
+
+    # 1) valid_window
+    if valid_window_only and "valid_window" in df.columns:
+        keep &= df["valid_window"].fillna(False).to_numpy(dtype=bool)
+
+    # 2) valid_face_ratio
+    if min_valid_face_ratio is not None:
+        if "valid_face_ratio" not in df.columns:
+            raise ValueError("window_df missing column 'valid_face_ratio'")
+        keep &= (df["valid_face_ratio"].fillna(-np.inf).to_numpy(dtype=float) >= min_valid_face_ratio)
+
+    # 3) n_face_frames_total
+    if min_face_frames is not None:
+        if "n_face_frames_total" not in df.columns:
+            raise ValueError("window_df missing column 'n_face_frames_total'")
+        keep &= (df["n_face_frames_total"].fillna(-1).to_numpy(dtype=float) >= min_face_frames)
+
+    # 4) p_non_neutral
+    if min_non_neutral is not None:
+        if "p_non_neutral" not in df.columns:
+            raise ValueError("window_df missing column 'p_non_neutral'")
+        keep &= (df["p_non_neutral"].fillna(-np.inf).to_numpy(dtype=float) >= min_non_neutral)
+
+    # 5) hard_label
+    if allowed_hard_labels is not None:
+        if "hard_label" not in df.columns:
+            raise ValueError("window_df missing column 'hard_label'")
+        keep &= df["hard_label"].isin(allowed_hard_labels).to_numpy(dtype=bool)
+
+    # 6) 模态非空要求
+    if require_modalities_nonempty is not None:
+        for mod in require_modalities_nonempty:
+            if mod not in seqs:
+                raise ValueError(f"sequences missing modality: {mod}")
+
+            mod_keep = []
+            for s in seqs[mod]:
+                ok = (s is not None) and (len(s) > 0)
+                mod_keep.append(ok)
+            keep &= np.asarray(mod_keep, dtype=bool)
+
+    idx = np.where(keep)[0]
+
+    filtered_df = df.iloc[idx].reset_index(drop=True)
+    filtered_seqs = {}
+
+    for mod, seq_list in seqs.items():
+        filtered_seqs[mod] = [seq_list[i] for i in idx]
+
+    if verbose:
+        print(f"[filter_window_dataset] kept {len(idx)} / {n0} windows")
+
+    return {
+        "window_df": filtered_df,
+        "sequences": filtered_seqs,
+        "config": config,
+        "kept_original_indices": idx,
+    }
+
+
+def concat_subject_window_data(
+    all_window_data: Dict[Any, Dict[str, Any]],
+    subjects: Optional[List[Any]] = None,
+    modality_keys: Optional[List[str]] = None,
+    add_subject_column: bool = True,
+    reset_index: bool = True,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    把多个被试的 window dataset 拼起来。
+
+    Parameters
+    ----------
+    all_window_data : dict
+        build_all_subject_window_datasets(...) 或过滤后的结果:
+        {
+            sub1: {"window_df": ..., "sequences": ..., "config": ...},
+            sub2: {"window_df": ..., "sequences": ..., "config": ...},
+            ...
+        }
+
+    subjects : list or None
+        指定要拼接的被试；None 表示全部
+
+    modality_keys : list[str] or None
+        指定要拼接哪些模态；None 表示取所有被试共有/出现过的模态并集
+
+    add_subject_column : bool
+        若 window_df 中没有 "sub" 列，则自动加上
+
+    reset_index : bool
+        是否重置拼接后 df 的索引
+
+    verbose : bool
+        是否打印拼接信息
+
+    Returns
+    -------
+    concat_data : dict
+        {
+            "window_df": DataFrame,
+            "sequences": {
+                mod1: list[np.ndarray],
+                mod2: list[np.ndarray],
+                ...
+            },
+            "subject_slices": {
+                sub1: slice(start, end),
+                sub2: slice(start, end),
+                ...
+            },
+            "subjects": [...],
+        }
+    """
+    if subjects is None:
+        subjects = list(all_window_data.keys())
+
+    # 过滤只保留存在的 subjects
+    subjects = [s for s in subjects if s in all_window_data]
+    if len(subjects) == 0:
+        raise ValueError("No valid subjects found in all_window_data.")
+
+    # 推断模态
+    if modality_keys is None:
+        modality_set = set()
+        for sub in subjects:
+            modality_set.update(all_window_data[sub]["sequences"].keys())
+        modality_keys = sorted(modality_set)
+
+    df_list = []
+    concat_seqs = {mod: [] for mod in modality_keys}
+    subject_slices = {}
+
+    cursor = 0
+
+    for sub in subjects:
+        sub_data = all_window_data[sub]
+        df = sub_data["window_df"].copy()
+        seqs = sub_data["sequences"]
+
+        if add_subject_column and "sub" not in df.columns:
+            df.insert(0, "sub", sub)
+
+        n_sub = len(df)
+
+        # 检查长度一致
+        for mod in modality_keys:
+            if mod not in seqs:
+                raise ValueError(f"Subject {sub} missing modality '{mod}' in sequences")
+            if len(seqs[mod]) != n_sub:
+                raise ValueError(
+                    f"Length mismatch in subject {sub}, modality {mod}: "
+                    f"len(seqs)={len(seqs[mod])}, len(window_df)={n_sub}"
+                )
+
+        df_list.append(df)
+
+        for mod in modality_keys:
+            concat_seqs[mod].extend(seqs[mod])
+
+        subject_slices[sub] = slice(cursor, cursor + n_sub)
+        cursor += n_sub
+
+        if verbose:
+            print(f"[concat] sub={sub}, n_windows={n_sub}")
+
+    concat_df = pd.concat(df_list, axis=0)
+    if reset_index:
+        concat_df = concat_df.reset_index(drop=True)
+
+    if verbose:
+        print(f"[concat_subject_window_data] total windows = {len(concat_df)}")
+
+    return {
+        "window_df": concat_df,
+        "sequences": concat_seqs,
+        "subject_slices": subject_slices,
+        "subjects": subjects,
+        "modality_keys": modality_keys,
+    }
