@@ -15,6 +15,68 @@ import traceback
 # signal processing
 from scipy.signal import butter, sosfiltfilt, hilbert
 from collections.abc import Iterable
+from scipy.signal import butter, filtfilt
+
+
+# -----------------------
+# filter function
+# -----------------------
+def apply_signal_filter(x, fs, filter_spec):
+    """
+    x: [T] or [T, D]
+    fs: sampling rate
+    filter_spec: dict
+        examples:
+        {"type": "bandpass", "low": 0.5, "high": 150.0, "order": 4}
+        {"type": "lowpass", "high": 20.0, "order": 4}
+        {"type": "highpass", "low": 0.5, "order": 4}
+    """
+    if x is None or fs is None:
+        return x
+
+    x = np.asarray(x, dtype=np.float64)
+    if x.ndim == 1:
+        x_in = x[:, None]
+        squeeze_back = True
+    else:
+        x_in = x
+        squeeze_back = False
+
+    nyq = fs / 2.0
+    ftype = filter_spec.get("type", "bandpass")
+    order = filter_spec.get("order", 4)
+
+    if ftype == "bandpass":
+        low = filter_spec["low"] / nyq
+        high = filter_spec["high"] / nyq
+        b, a = butter(order, [low, high], btype="bandpass")
+
+    elif ftype == "lowpass":
+        high = filter_spec["high"] / nyq
+        b, a = butter(order, high, btype="lowpass")
+
+    elif ftype == "highpass":
+        low = filter_spec["low"] / nyq
+        b, a = butter(order, low, btype="highpass")
+
+    else:
+        raise ValueError(f"Unknown filter type: {ftype}")
+
+    x_out = np.empty_like(x_in)
+    for d in range(x_in.shape[1]):
+        col = x_in[:, d]
+        if np.isnan(col).all():
+            x_out[:, d] = col
+            continue
+
+        valid_mean = np.nanmean(col)
+        col_fill = np.where(np.isnan(col), valid_mean, col)
+        x_out[:, d] = filtfilt(b, a, col_fill)
+
+    if squeeze_back:
+        x_out = x_out[:, 0]
+
+    return x_out
 
 
 # -----------------------
@@ -449,6 +511,8 @@ def load_multimodal_subjects_movie_aligned(
     bids_root: Union[str, Path],
     *,
     max_nwb_samples: Optional[int] = None,
+    b_filter_data: Optional[bool] = True,
+    filter_config=None,
 
     # analysis grid
     grid_source: str = "movie_frame_time",   # {"movie_frame_time", "uniform", "lfp_raw"}
@@ -591,6 +655,25 @@ def load_multimodal_subjects_movie_aligned(
                     f"Unknown grid_source={grid_source!r}. "
                     f"Use one of: 'movie_frame_time', 'uniform', 'lfp_raw'."
                 )
+            
+            # =========================================================
+            # 6) Optional filtering on raw continuous signals
+            # =========================================================
+            if b_filter_data:
+                if filter_config is None:
+                    filter_config = {}
+
+                if lfp_macro is not None and "lfp_macro" in filter_config:
+                    lfp_macro = apply_signal_filter(lfp_macro, fs_macro, filter_config["lfp_macro"])
+
+                if lfp_micro is not None and "lfp_micro" in filter_config:
+                    lfp_micro = apply_signal_filter(lfp_micro, fs_micro, filter_config["lfp_micro"])
+
+                if gaze is not None and fs_eye is not None and "eye_gaze" in filter_config:
+                    gaze = apply_signal_filter(gaze, fs_eye, filter_config["eye_gaze"])
+
+                if pupil is not None and fs_eye is not None and "pupil" in filter_config:
+                    pupil = apply_signal_filter(pupil, fs_eye, filter_config["pupil"])
 
             # =========================================================
             # 6) Continuous modalities -> resample
