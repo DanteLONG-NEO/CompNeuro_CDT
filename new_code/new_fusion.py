@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from sklearn.cross_decomposition import CCA
 from sklearn.decomposition import PCA
 from scipy.signal import detrend
-
+from scipy.signal import spectrogram
 
 # ====================================
 # basic utils
@@ -306,7 +306,7 @@ def build_modality_feature_dict(concat_data, modality_keys=None, mode="channel_m
             f = _window_to_feature(
                 x,
                 mode=mode,
-                fs=1000,
+                fs=250,
                 bands={
                     "delta": (1, 4),
                     "theta": (4, 8),
@@ -1801,8 +1801,8 @@ def plot_time_cca_mean_timeseries_heatmap(
     key, reversed_order = _get_pair_key(time_cca_res, mod1, mod2)
     res = time_cca_res[key]
 
-    Xi = res["grand_mean_Xi"]   # [T, K]
-    Xj = res["grand_mean_Xj"]   # [T, K]
+    Xi = res["grand_mean_Xi"].T  # [T, K]
+    Xj = res["grand_mean_Xj"].T   # [T, K]
 
     if reversed_order:
         Xi, Xj = Xj, Xi
@@ -1818,16 +1818,190 @@ def plot_time_cca_mean_timeseries_heatmap(
 
     im0 = axes[0, 0].imshow(Xi, aspect="auto", origin="lower")
     axes[0, 0].set_title(mod1)
-    axes[0, 0].set_xlabel("CCA component")
-    axes[0, 0].set_ylabel("time step")
+    axes[0, 0].set_xlabel("time step")
+    axes[0, 0].set_ylabel("CCA component")
     plt.colorbar(im0, ax=axes[0, 0])
 
     im1 = axes[0, 1].imshow(Xj, aspect="auto", origin="lower")
     axes[0, 1].set_title(mod2)
-    axes[0, 1].set_xlabel("CCA component")
-    axes[0, 1].set_ylabel("time step")
+    axes[0, 1].set_xlabel("time step")
+    axes[0, 1].set_ylabel("CCA component")
     plt.colorbar(im1, ax=axes[0, 1])
 
     fig.suptitle(title)
     plt.tight_layout()
     plt.show()
+
+
+def plot_time_cca_latent_spectrogram(
+    time_cca_res,
+    mod1,
+    mod2,
+    feature_mode="first",   # "first" | "mean"
+    which="both",           # "mod1" | "mod2" | "both"
+    fs=1.0,                 # time axis sampling rate
+    nperseg=None,
+    noverlap=None,
+    detrend="constant",
+    scaling="density",
+    mode="psd",             # "psd" | "magnitude"
+    log_power=True,
+    title=None,
+):
+    """
+    对 time-CCA 的 grand mean latent 时序做时频分解并画图。
+
+    Parameters
+    ----------
+    time_cca_res : dict
+        time-CCA result dict
+
+    mod1, mod2 : str
+        modality names
+
+    feature_mode : str
+        "first" -> 用第1个 CCA component 的时间序列
+        "mean"  -> 对所有 CCA component 在 axis=1 上取均值，得到单变量时间序列
+
+    which : str
+        "mod1" | "mod2" | "both"
+
+    fs : float
+        时间采样率。如果每个 time step 对应 1 个采样点，就设成 1；
+        如果你知道真实 Hz，比如 window 内是 25 Hz，就传 25。
+
+    nperseg, noverlap : int or None
+        spectrogram 参数
+
+    mode : str
+        "psd" 或 "magnitude"
+
+    log_power : bool
+        是否画 log(1 + Sxx)
+
+    Returns
+    -------
+    out : dict
+        包含频率、时间、谱图结果
+    """
+    key, reversed_order = _get_pair_key(time_cca_res, mod1, mod2)
+    res = time_cca_res[key]
+
+    Xi = np.asarray(res["grand_mean_Xi"], dtype=float)   # [T, K]
+    Xj = np.asarray(res["grand_mean_Xj"], dtype=float)   # [T, K]
+
+    if reversed_order:
+        Xi, Xj = Xj, Xi
+
+    def _reduce_latent(X, feature_mode="first"):
+        if X.ndim != 2:
+            raise ValueError(f"Expected [T, K], got shape={X.shape}")
+
+        if feature_mode == "first":
+            return X[:, 0]
+        elif feature_mode == "mean":
+            return np.nanmean(X, axis=1)
+        else:
+            raise ValueError("feature_mode must be 'first' or 'mean'")
+
+    xi_1d = _reduce_latent(Xi, feature_mode=feature_mode)
+    xj_1d = _reduce_latent(Xj, feature_mode=feature_mode)
+
+    if nperseg is None:
+        nperseg = min(64, len(xi_1d))
+    if noverlap is None:
+        noverlap = nperseg // 2
+
+    def _spec(x):
+        f, t, Sxx = spectrogram(
+            x,
+            fs=fs,
+            nperseg=nperseg,
+            noverlap=noverlap,
+            detrend=detrend,
+            scaling=scaling,
+            mode=mode,
+        )
+        if log_power:
+            Sxx = np.log1p(Sxx)
+        return f, t, Sxx
+
+    out = {}
+
+    if which in ["mod1", "both"]:
+        f1, t1, S1 = _spec(xi_1d)
+        out[mod1] = {
+            "signal": xi_1d,
+            "freqs": f1,
+            "times": t1,
+            "spec": S1,
+        }
+
+    if which in ["mod2", "both"]:
+        f2, t2, S2 = _spec(xj_1d)
+        out[mod2] = {
+            "signal": xj_1d,
+            "freqs": f2,
+            "times": t2,
+            "spec": S2,
+        }
+
+    if which == "both":
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4), squeeze=False)
+
+        pcm0 = axes[0, 0].pcolormesh(
+            out[mod1]["times"],
+            out[mod1]["freqs"],
+            out[mod1]["spec"],
+            shading="auto",
+        )
+        axes[0, 0].set_title(f"{mod1} ({feature_mode})")
+        axes[0, 0].set_xlabel("time (s)")
+        axes[0, 0].set_ylabel("frequency (Hz)")
+        plt.colorbar(pcm0, ax=axes[0, 0])
+
+        pcm1 = axes[0, 1].pcolormesh(
+            out[mod2]["times"],
+            out[mod2]["freqs"],
+            out[mod2]["spec"],
+            shading="auto",
+        )
+        axes[0, 1].set_title(f"{mod2} ({feature_mode})")
+        axes[0, 1].set_xlabel("time (s)")
+        axes[0, 1].set_ylabel("frequency (Hz)")
+        plt.colorbar(pcm1, ax=axes[0, 1])
+
+        if title is None:
+            title = f"Time-frequency of time-CCA latent ({feature_mode}): {mod1} vs {mod2}"
+        fig.suptitle(title)
+        plt.tight_layout()
+        plt.show()
+
+    else:
+        mod = mod1 if which == "mod1" else mod2
+        fig, ax = plt.subplots(figsize=(6, 4))
+
+        pcm = ax.pcolormesh(
+            out[mod]["times"],     # x: time (s)
+            out[mod]["freqs"],     # y: frequency (Hz)
+            out[mod]["spec"],      # [F, T]
+            shading="auto",
+        )
+
+        ax.set_title(f"{mod} ({feature_mode})")
+        ax.set_xlabel("time (s)")
+        ax.set_ylabel("frequency (Hz)")
+        plt.colorbar(pcm, ax=ax)
+
+        T = len(out[mod]["signal"])
+        duration = T / fs
+        ax.set_xlim(0, duration)
+
+        if title is None:
+            title = f"Time-frequency of time-CCA latent ({feature_mode}): {mod}"
+        plt.suptitle(title)
+
+        plt.tight_layout()
+        plt.show()
+
+    return out

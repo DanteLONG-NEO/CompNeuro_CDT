@@ -21,7 +21,7 @@ from scipy.signal import butter, filtfilt
 # -----------------------
 # filter function
 # -----------------------
-def apply_signal_filter(x, fs, filter_spec):
+def _apply_one_filter(x, fs, filter_spec):
     """
     x: [T] or [T, D]
     fs: sampling rate
@@ -30,6 +30,7 @@ def apply_signal_filter(x, fs, filter_spec):
         {"type": "bandpass", "low": 0.5, "high": 150.0, "order": 4}
         {"type": "lowpass", "high": 20.0, "order": 4}
         {"type": "highpass", "low": 0.5, "order": 4}
+        {"type": "bandstop", "low": 58.0, "high": 62.0, "order": 4}
     """
     if x is None or fs is None:
         return x
@@ -59,6 +60,11 @@ def apply_signal_filter(x, fs, filter_spec):
         low = filter_spec["low"] / nyq
         b, a = butter(order, low, btype="highpass")
 
+    elif ftype == "bandstop":
+        low = filter_spec["low"] / nyq
+        high = filter_spec["high"] / nyq
+        b, a = butter(order, [low, high], btype="bandstop")
+
     else:
         raise ValueError(f"Unknown filter type: {ftype}")
 
@@ -78,6 +84,25 @@ def apply_signal_filter(x, fs, filter_spec):
 
     return x_out
 
+def apply_signal_filter(x, fs, filter_spec):
+    """
+    支持:
+    1) 单个 dict
+    2) list[dict]，按顺序依次应用
+    """
+    if x is None or fs is None or filter_spec is None:
+        return x
+
+    if isinstance(filter_spec, dict):
+        return _apply_one_filter(x, fs, filter_spec)
+
+    if isinstance(filter_spec, (list, tuple)):
+        y = x
+        for spec in filter_spec:
+            y = _apply_one_filter(y, fs, spec)
+        return y
+
+    raise TypeError("filter_spec must be a dict or a list/tuple of dicts")
 
 # -----------------------
 # Subject mapping (int -> ids)
@@ -409,14 +434,50 @@ def _zero_fill(x):
 def _fill_gaze_pixel(x):
     return _interp_fill(x)
 
-
-def fill_nan_by_modality(sub_dict, fill_bold: bool = False):
+def _drop_all_nan_features(x, verbose=False, name=""):
     """
-    sub_dict: out[sub] 这一层 dict
-    只填充模态数据中的 NaN，不修改 time_grid / meta / time_raw
+    x: [T, D] or [T]
+    return:
+        x_new: 去掉全 NaN 列后的数据
+        keep_mask: 保留的列 mask
+    """
+    x = np.asarray(x, dtype=np.float64)
+
+    if x.ndim == 1:
+        # 1D 情况：要么全 NaN，要么不用 drop
+        if np.isnan(x).all():
+            if verbose:
+                print(f"[drop] {name}: all NaN (1D), return zeros")
+            return np.zeros_like(x), np.array([False])
+        return x, np.array([True])
+
+    # 2D: [T, D]
+    keep = ~np.isnan(x).all(axis=0)
+
+    if verbose:
+        n_drop = (~keep).sum()
+        if n_drop > 0:
+            print(f"[drop] {name}: drop {n_drop}/{x.shape[1]} all-NaN features")
+
+    if keep.sum() == 0:
+        if verbose:
+            print(f"[WARN] {name}: all features are NaN → return zeros")
+        return np.zeros_like(x[:, :1]), keep
+
+    return x[:, keep], keep
+
+
+def fill_nan_by_modality(sub_dict, fill_bold: bool = False, verbose: bool = False):
+    """
+    改进版：
+    1. 填 NaN
+    2. 自动 drop 全 NaN feature（关键改动）
     """
     d = sub_dict.copy()
 
+    # -----------------------
+    # spikes
+    # -----------------------
     if "spikes" in d and d["spikes"] is not None:
         if isinstance(d["spikes"], list):
             filled_spikes = []
@@ -429,13 +490,26 @@ def fill_nan_by_modality(sub_dict, fill_bold: bool = False):
         else:
             d["spikes"] = _zero_fill(d["spikes"])
 
+    # -----------------------
+    # firing_rate
+    # -----------------------
     if "firing_rate" in d and d["firing_rate"] is not None:
-        d["firing_rate"] = _zero_fill(d["firing_rate"])
+        X = _zero_fill(d["firing_rate"])
+        X, _ = _drop_all_nan_features(X, verbose, "firing_rate")
+        d["firing_rate"] = X
 
+    # -----------------------
+    # LFP（关键问题源）
+    # -----------------------
     for k in ["lfp_macro", "lfp_micro"]:
         if k in d and d[k] is not None:
-            d[k] = _interp_fill(d[k])
+            X = _interp_fill(d[k])
+            X, _ = _drop_all_nan_features(X, verbose, k)
+            d[k] = X
 
+    # -----------------------
+    # bandpower
+    # -----------------------
     if "lfp_bandpower" in d and d["lfp_bandpower"] is not None:
         if isinstance(d["lfp_bandpower"], dict):
             filled_bp = {}
@@ -443,17 +517,36 @@ def fill_nan_by_modality(sub_dict, fill_bold: bool = False):
                 if bp is None:
                     filled_bp[band_name] = None
                 else:
-                    filled_bp[band_name] = _interp_fill(bp)
+                    X = _interp_fill(bp)
+                    X, _ = _drop_all_nan_features(
+                        X, verbose, f"lfp_bandpower[{band_name}]"
+                    )
+                    filled_bp[band_name] = X
             d["lfp_bandpower"] = filled_bp
         else:
-            d["lfp_bandpower"] = _interp_fill(d["lfp_bandpower"])
+            X = _interp_fill(d["lfp_bandpower"])
+            X, _ = _drop_all_nan_features(X, verbose, "lfp_bandpower")
+            d["lfp_bandpower"] = X
 
+    # -----------------------
+    # eye_gaze
+    # -----------------------
     if "eye_gaze" in d and d["eye_gaze"] is not None:
-        d["eye_gaze"] = _fill_gaze_pixel(d["eye_gaze"])
+        X = _fill_gaze_pixel(d["eye_gaze"])
+        X, _ = _drop_all_nan_features(X, verbose, "eye_gaze")
+        d["eye_gaze"] = X
 
+    # -----------------------
+    # pupil
+    # -----------------------
     if "pupil" in d and d["pupil"] is not None:
-        d["pupil"] = _ffill_bfill(d["pupil"])
+        X = _ffill_bfill(d["pupil"])
+        X, _ = _drop_all_nan_features(X, verbose, "pupil")
+        d["pupil"] = X
 
+    # -----------------------
+    # bold
+    # -----------------------
     if fill_bold and "bold" in d and d["bold"] is not None:
         if isinstance(d["bold"], list):
             filled_bold = []
@@ -461,12 +554,27 @@ def fill_nan_by_modality(sub_dict, fill_bold: bool = False):
                 if b is None:
                     filled_bold.append(None)
                 else:
-                    filled_bold.append(_interp_fill(b))
+                    X = _interp_fill(b)
+                    X, _ = _drop_all_nan_features(X, verbose, "bold")
+                    filled_bold.append(X)
             d["bold"] = filled_bold
         else:
-            d["bold"] = _interp_fill(d["bold"])
+            X = _interp_fill(d["bold"])
+            X, _ = _drop_all_nan_features(X, verbose, "bold")
+            d["bold"] = X
 
     return d
+
+def remove_dead_channels(sub_dict, key):
+    X = sub_dict[key]
+    if X is None:
+        return sub_dict
+
+    X = np.asarray(X)
+    keep = ~np.isnan(X).all(axis=0)
+
+    sub_dict[key] = X[:, keep]
+    return sub_dict
 
 
 # -----------------------
@@ -618,6 +726,9 @@ def load_multimodal_subjects_movie_aligned(
                 dt_eye = np.median(np.diff(t_eye_movie))
                 if dt_eye > 0:
                     fs_eye = 1.0 / dt_eye
+
+            if verbose:
+                print(f"[sub {sub}] t_eye_raw range=({t_eye_movie[0]:.3f}, {t_eye_movie[-1]:.3f})")
 
             # =========================================================
             # 4) Load spikes

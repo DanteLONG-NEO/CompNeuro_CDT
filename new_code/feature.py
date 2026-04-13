@@ -97,6 +97,97 @@ def _normalize_by_baseline(
         return (X - mu) / denom
     else:
         raise ValueError(f"Unknown baseline normalization mode: {mode}")
+    
+def _normalize_array(X, method="zscore", eps=1e-8):
+    """
+    X: [T, D]
+    return: [T, D]
+    """
+    if method == "zscore":
+        mean = np.nanmean(X, axis=0, keepdims=True)
+        std = np.nanstd(X, axis=0, keepdims=True)
+
+        std = np.where(std < eps, 1.0, std)
+
+        return (X - mean) / std
+
+    elif method == "max":
+        max_abs = np.nanmax(np.abs(X), axis=0, keepdims=True)
+        max_abs = np.where(max_abs < eps, 1.0, max_abs)
+
+        return X / max_abs
+
+    elif method == "min_max":
+        xmin = np.nanmin(X, axis=0, keepdims=True)
+        xmax = np.nanmax(X, axis=0, keepdims=True)
+
+        scale = xmax - xmin
+        scale = np.where(scale < eps, 1.0, scale)
+
+        return (X - xmin) / scale
+
+    else:
+        raise ValueError(f"Unknown norm_method: {method}")
+    
+def normalize_subject_modalities(
+    sub_dict: Dict[str, Any],
+    modality_keys: Optional[List[str]] = None,
+    norm_method: str = "zscore",
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    对单个被试的多个模态做 normalization（非 baseline）。
+
+    Parameters
+    ----------
+    sub_dict : dict
+        单个 subject 的数据
+
+    modality_keys : list[str] or None
+        要处理的模态；None → 自动检测所有 ndarray-like
+
+    norm_method : str
+        "zscore" | "max" | "min_max"
+
+    Returns
+    -------
+    new_sub : dict
+        归一化后的新 dict（不改原始）
+    """
+    new_sub = dict(sub_dict)
+
+    if modality_keys is None:
+        modality_keys = [
+            k for k, v in sub_dict.items()
+            if isinstance(v, (list, np.ndarray))
+        ]
+
+    for key in modality_keys:
+        if key not in sub_dict or sub_dict[key] is None:
+            continue
+
+        try:
+            X_raw = sub_dict[key]
+            X = _as_2d(X_raw)
+
+            if X.size == 0 or np.isnan(X).all():
+                if verbose:
+                    print(f"[WARN] {key}: empty or all NaN → skip")
+                continue
+
+            Xn = _normalize_array(X, method=norm_method)
+
+            if np.asarray(X_raw).ndim == 1:
+                Xn = Xn[:, 0]
+
+            new_sub[key] = Xn
+
+        except Exception as e:
+            if verbose:
+                print(f"[WARN] {key}: normalization failed → keep original ({e})")
+            new_sub[key] = sub_dict[key]
+
+    return new_sub
 
 
 def _infer_emotion_cols(df_face_note: pd.DataFrame) -> List[str]:
@@ -293,7 +384,7 @@ def baseline_normalize_subject_modalities(
     new_sub = dict(sub_dict)
 
     if modality_keys is None:
-        modality_keys = ["firing_rate", "lfp_macro", "lfp_micro", "lfp_bandpower", "eye_gaze", "pupil"]
+        modality_keys = ["lfp_macro", "lfp_micro", "lfp_bandpower"]
 
     if baseline_time_key not in sub_dict:
         raise ValueError(f"sub_dict missing baseline_time_key: {baseline_time_key}")
@@ -313,13 +404,13 @@ def baseline_normalize_subject_modalities(
 
         X = _as_2d(sub_dict[key]).astype(float)
         if len(X) != len(t):
-            # 只处理和 time_grid 对齐的模态
+            print(f"Warning: modality '{key}' length {len(X)} does not match time length {len(t)}. Skipping baseline normalization for this modality.")
             continue
 
         Xb = X[baseline_mask]
         Xn = _normalize_by_baseline(X, Xb, mode=mode)
+        print(f"normalized modality '{key}' with baseline mode '{mode}' using {baseline_mask.sum()} baseline samples.")
 
-        # 保持原来的维度风格
         if np.asarray(sub_dict[key]).ndim == 1:
             Xn = Xn[:, 0]
 
@@ -432,6 +523,7 @@ def build_subject_window_dataset(
     end_time: Optional[float] = None,
     remove_baseline_windows: bool = True,
     do_baseline_norm: bool = True,
+    norm_modality_dict: Optional[Dict[str, bool]] = None,
     baseline_mode: Optional[str] = "zscore",
     baseline_start: float = -10.0,
     baseline_end: float = 0.0,
@@ -450,17 +542,27 @@ def build_subject_window_dataset(
     if modality_keys is None:
         modality_keys = ["firing_rate", "lfp_macro", "lfp_micro", "lfp_bandpower", "eye_gaze", "pupil"]
 
+    baseline_modality_keys = ["lfp_macro", "lfp_micro"]
+
     # 1) baseline normalize
     sub_proc = sub_dict
     if do_baseline_norm:
         sub_proc = baseline_normalize_subject_modalities(
             sub_proc,
-            modality_keys=modality_keys,
+            modality_keys=baseline_modality_keys,
             baseline_time_key="time_grid",
             baseline_start=baseline_start,
             baseline_end=baseline_end,
             mode=baseline_mode,
         )
+
+    for key, [do_norm, norm_method] in (norm_modality_dict or {}).items():
+        if do_norm:
+            sub_proc = normalize_subject_modalities(
+                sub_proc,
+                modality_keys=[key],
+                norm_method=norm_method,
+            )
 
     # 2) neural sequences
     neural_pack = extract_windowed_neural_sequences_for_subject(
@@ -530,6 +632,7 @@ def build_all_subject_window_datasets(
     end_time: Optional[float] = None,
     remove_baseline_windows: bool = True,
     do_baseline_norm: bool = True,
+    norm_modality_dict: Optional[Dict[str, bool]] = None,
     baseline_mode: Optional[str] = "zscore",
     baseline_start: float = -10.0,
     baseline_end: float = 0.0,
@@ -565,6 +668,7 @@ def build_all_subject_window_datasets(
                 end_time=end_time,
                 remove_baseline_windows=remove_baseline_windows,
                 do_baseline_norm=do_baseline_norm,
+                norm_modality_dict=norm_modality_dict,
                 baseline_mode=baseline_mode,
                 baseline_start=baseline_start,
                 baseline_end=baseline_end,
