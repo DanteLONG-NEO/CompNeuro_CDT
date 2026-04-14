@@ -212,6 +212,19 @@ class SequentialModel(nn.Module):
             outputs.append(pooled)
 
         return torch.stack(outputs, dim=0)
+
+    def attn_pool(self, x: torch.Tensor):
+        """
+        x: [B, T, D]
+
+        returns:
+            pooled: [B, D]
+            attn_w: [B, T]
+        """
+        logits = self.attn_score(x).squeeze(-1)   # [B, T]
+        attn_w = torch.softmax(logits, dim=1)     # [B, T]
+        pooled = torch.sum(x * attn_w.unsqueeze(-1), dim=1)  # [B, D]
+        return pooled, attn_w
     
     def forward(self, x: torch.Tensor, return_attn: bool = False):
         """
@@ -223,22 +236,7 @@ class SequentialModel(nn.Module):
         # sequential encoding
         # -----------------------------
         if self.model_type in {"gru", "lstm"}:
-            lengths = torch.sum(torch.any(x != 0, dim=-1), dim=1)  # [B]
-            packed = nn.utils.rnn.pack_padded_sequence(
-                x,
-                lengths,
-                batch_first=True,
-                enforce_sorted=False,
-            )
-
-            packed_out, _ = self.seq(packed)
-
-            h_seq, _ = nn.utils.rnn.pad_packed_sequence(
-                packed_out,
-                batch_first=True,
-                total_length=x.size(1),
-            )
-
+            h_seq, _ = self.seq(x)
         elif self.model_type == "transformer":
             h_seq = self.seq(
                 x
