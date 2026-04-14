@@ -2,6 +2,9 @@ import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Any
 
+import copy
+from sklearn.decomposition import PCA
+
 def make_lagged_matrix(X, lags):
     """
     X: [T, D]
@@ -965,3 +968,211 @@ def concat_subject_window_data(
         "subjects": subjects,
         "modality_keys": modality_keys,
     }
+
+
+def apply_subjectwise_pca_to_modalities(
+    out,
+    modality_pca_dict,
+    copy_data=True,
+    fillna_value=0.0,
+    store_pca_model=False,
+    verbose=True,
+):
+    """
+    对 out 中每个 subject 的指定 modality 做 subject-wise PCA，
+    返回与 out 相同的数据结构。
+
+    Parameters
+    ----------
+    out : dict
+        结构类似:
+        {
+            sub: {
+                "lfp_macro": np.ndarray[T, D],
+                "lfp_micro": np.ndarray[T, D],
+                "eye_gaze": np.ndarray[T, D],
+                ...
+                "meta": {...}
+            },
+            ...
+        }
+
+    modality_pca_dict : dict
+        类似:
+        {
+            "lfp_micro": 10,
+            "lfp_macro": 10,
+            "eye_gaze": 5,
+            "pupil": 0,
+        }
+
+        规则:
+        - 如果 modality 不在 dict 里: 不做 PCA，原样返回
+        - 如果值是 0: 不做 PCA，原样返回
+        - 如果值 > 0: 做 PCA 到 min(目标维数, 原始特征维数)
+
+    copy_data : bool, default=True
+        True: 深拷贝后返回，不修改原 out
+        False: 原地修改并返回
+
+    fillna_value : float, default=0.0
+        PCA 前若数据中有 NaN，用该值填充
+
+    store_pca_model : bool, default=False
+        是否把每个 sub / modality 的 PCA model 存下来。
+        注意这会让返回对象更大。
+
+    verbose : bool, default=True
+        是否打印处理信息
+
+    Returns
+    -------
+    out_pca : dict
+        与 out 相同结构，但指定 modality 被 PCA 后替换。
+    """
+
+    if not isinstance(out, dict):
+        raise TypeError("`out` must be a dict like {sub: data_dict}")
+
+    if modality_pca_dict is None:
+        modality_pca_dict = {}
+
+    out_pca = copy.deepcopy(out) if copy_data else out
+
+    for sub, sub_dict in out_pca.items():
+        if not isinstance(sub_dict, dict):
+            if verbose:
+                print(f"[skip] sub={sub}: value is not a dict")
+            continue
+
+        # 确保 meta 存在
+        if "meta" not in sub_dict or sub_dict["meta"] is None:
+            sub_dict["meta"] = {}
+
+        if "modality_pca" not in sub_dict["meta"] or sub_dict["meta"]["modality_pca"] is None:
+            sub_dict["meta"]["modality_pca"] = {}
+
+        if store_pca_model and "modality_pca_models" not in sub_dict["meta"]:
+            sub_dict["meta"]["modality_pca_models"] = {}
+
+        for modality, target_dim in modality_pca_dict.items():
+            # modality 不存在：跳过
+            if modality not in sub_dict:
+                if verbose:
+                    print(f"[skip] sub={sub}, modality={modality}: not found")
+                continue
+
+            x = sub_dict[modality]
+
+            # None: 跳过
+            if x is None:
+                sub_dict["meta"]["modality_pca"][modality] = {
+                    "applied": False,
+                    "reason": "input is None",
+                }
+                if verbose:
+                    print(f"[skip] sub={sub}, modality={modality}: input is None")
+                continue
+
+            x = np.asarray(x)
+
+            # target_dim == 0: 不做 PCA
+            if target_dim == 0:
+                sub_dict["meta"]["modality_pca"][modality] = {
+                    "applied": False,
+                    "reason": "target_dim == 0",
+                    "orig_shape": tuple(x.shape),
+                    "new_shape": tuple(x.shape),
+                }
+                if verbose:
+                    print(f"[keep] sub={sub}, modality={modality}: target_dim=0, keep original")
+                continue
+
+            # 只处理二维 [T, D]
+            if x.ndim != 2:
+                sub_dict["meta"]["modality_pca"][modality] = {
+                    "applied": False,
+                    "reason": f"expected 2D [T, D], got ndim={x.ndim}",
+                    "orig_shape": tuple(x.shape),
+                    "new_shape": tuple(x.shape),
+                }
+                if verbose:
+                    print(f"[skip] sub={sub}, modality={modality}: expected 2D, got shape={x.shape}")
+                continue
+
+            T, D = x.shape
+
+            # 空数组 / 特征维异常
+            if T == 0 or D == 0:
+                sub_dict["meta"]["modality_pca"][modality] = {
+                    "applied": False,
+                    "reason": "empty input",
+                    "orig_shape": tuple(x.shape),
+                    "new_shape": tuple(x.shape),
+                }
+                if verbose:
+                    print(f"[skip] sub={sub}, modality={modality}: empty shape={x.shape}")
+                continue
+
+            n_comp = min(int(target_dim), D, T)
+
+            # 有效维度太小，不值得 PCA
+            if n_comp <= 0:
+                sub_dict["meta"]["modality_pca"][modality] = {
+                    "applied": False,
+                    "reason": f"invalid n_components={n_comp}",
+                    "orig_shape": tuple(x.shape),
+                    "new_shape": tuple(x.shape),
+                }
+                if verbose:
+                    print(f"[skip] sub={sub}, modality={modality}: invalid n_comp={n_comp}")
+                continue
+
+            # 如果目标维度 >= 原维度，直接保留原值
+            if n_comp >= D:
+                sub_dict["meta"]["modality_pca"][modality] = {
+                    "applied": False,
+                    "reason": "target_dim >= original feature dim",
+                    "orig_shape": tuple(x.shape),
+                    "new_shape": tuple(x.shape),
+                    "orig_dim": int(D),
+                    "target_dim": int(target_dim),
+                    "used_dim": int(n_comp),
+                }
+                if verbose:
+                    print(f"[keep] sub={sub}, modality={modality}: target_dim >= D ({target_dim} >= {D})")
+                continue
+
+            # 处理 NaN
+            x_in = x.astype(np.float64, copy=True)
+            if np.isnan(x_in).any():
+                x_in = np.nan_to_num(x_in, nan=fillna_value)
+
+            # PCA
+            pca = PCA(n_components=n_comp)
+            x_pca = pca.fit_transform(x_in)   # [T, n_comp]
+
+            sub_dict[modality] = x_pca
+
+            sub_dict["meta"]["modality_pca"][modality] = {
+                "applied": True,
+                "orig_shape": tuple(x.shape),
+                "new_shape": tuple(x_pca.shape),
+                "orig_dim": int(D),
+                "target_dim": int(target_dim),
+                "used_dim": int(n_comp),
+                "explained_variance_ratio": pca.explained_variance_ratio_.tolist(),
+                "explained_variance_ratio_sum": float(np.sum(pca.explained_variance_ratio_)),
+            }
+
+            if store_pca_model:
+                sub_dict["meta"]["modality_pca_models"][modality] = pca
+
+            if verbose:
+                evr_sum = float(np.sum(pca.explained_variance_ratio_))
+                print(
+                    f"[pca] sub={sub}, modality={modality}: "
+                    f"{x.shape} -> {x_pca.shape}, explained_var_sum={evr_sum:.4f}"
+                )
+
+    return out_pca

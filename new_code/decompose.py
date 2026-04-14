@@ -700,7 +700,9 @@ def plot_pc_time_series_across_sub(
     # assume same T
     any_res = first_res
     T = any_res[g1]["Z"].shape[1]
+    D = any_res[g1]["Z"].shape[2]
     t = np.arange(T)
+    pcs = [pc for pc in pcs if pc - 1 < D]
 
     fig, axes = plt.subplots(
         len(pcs), 1,

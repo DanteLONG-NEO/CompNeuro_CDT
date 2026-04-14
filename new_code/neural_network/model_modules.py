@@ -178,7 +178,7 @@ class SequentialModel(nn.Module):
     def mean_pool(x, mask=None):
         if mask is None:
             return x.mean(dim=1)
-        return (x * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True)
+        return (x * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp_min(1)
 
     @staticmethod
     def max_pool(x, mask=None):
@@ -192,29 +192,15 @@ class SequentialModel(nn.Module):
         if mask is None:
             return x[:, -1, :]
         idx = mask.sum(dim=1) - 1
-        return x[torch.arange(x.size(0)), idx]
+        return x[torch.arange(x.size(0), device=x.device), idx]
 
     @staticmethod
-    def last_window_pool(
-        x: torch.Tensor,
-        window: int = 5,
-        mode: str = "mean",
-    ) -> torch.Tensor:
-        """
-        x:    [B, T, D]
-
-        window: number of last valid timesteps
-        mode:   "mean" or "max"
-
-        return:
-            [B, D]
-        """
+    def last_window_pool(x: torch.Tensor, window: int = 5, mode: str = "mean") -> torch.Tensor:
         B, T, D = x.shape
-
         outputs = []
 
         for b in range(B):
-            segment = x[b, -1-window:]   # [<=window, D]
+            segment = x[b, max(0, T - window):T]
 
             if mode == "mean":
                 pooled = segment.mean(dim=0)
@@ -225,24 +211,7 @@ class SequentialModel(nn.Module):
 
             outputs.append(pooled)
 
-        return torch.stack(outputs, dim=0)   # [B, D]
-
-    @staticmethod
-    def attn_pool(self, x: torch.Tensor):
-        """
-        x:    [B, T, D]
-        mask: [B, T] (1=valid, 0=pad)
-
-        returns:
-            pooled: [B, D]
-            attn_w: [B, T]
-        """
-
-        logits = self.attn_score(x).squeeze(-1)   # [B, T]
-        attn_w = torch.softmax(logits, dim=1)     # [B, T]
-        pooled = torch.sum(x * attn_w.unsqueeze(-1), dim=1)  # [B, D]
-
-        return pooled, attn_w
+        return torch.stack(outputs, dim=0)
     
     def forward(self, x: torch.Tensor, return_attn: bool = False):
         """
@@ -254,9 +223,10 @@ class SequentialModel(nn.Module):
         # sequential encoding
         # -----------------------------
         if self.model_type in {"gru", "lstm"}:
-
+            lengths = torch.sum(torch.any(x != 0, dim=-1), dim=1)  # [B]
             packed = nn.utils.rnn.pack_padded_sequence(
                 x,
+                lengths,
                 batch_first=True,
                 enforce_sorted=False,
             )
