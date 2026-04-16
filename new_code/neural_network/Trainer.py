@@ -113,9 +113,14 @@ def train_one_epoch(
     loss='mse',
     grad_clip: float = 1.0,
     y_order: Optional[List[str]] = None,
+    task_type: str = "regression",   # "regression" or "binary"
 ):
     model.train()
-    total_loss, total_acc, total_joint, n = 0.0, 0.0, 0.0, 0
+
+    total_loss = 0.0
+    total_mae = 0.0
+    total_acc = 0.0
+    n = 0
 
     loss_fn = LossFunction._resolve_loss(loss)
 
@@ -127,7 +132,7 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        z_seq, y_hat = model(x)
+        _, y_hat = model(x)
         loss_val = loss_fn(y_hat, y)
 
         loss_val.backward()
@@ -138,17 +143,33 @@ def train_one_epoch(
         bs = _get_batch_size(x, y)
         total_loss += loss_val.item() * bs
 
-        # 这里沿用你原来的 metric
-        m = metrics.metrics_r_cos_sin(y_hat.detach(), y.detach(), loss_fn=loss_fn)
-        total_acc += m["angle_acc"] * bs
-        total_joint += m["joint_acc"] * bs
+        # ============================
+        # metric (simple & correct)
+        # ============================
+        with torch.no_grad():
+            if task_type == "regression":
+                mae = torch.mean(torch.abs(y_hat - y))
+                total_mae += mae.item() * bs
+
+            elif task_type == "binary":
+                probs = torch.sigmoid(y_hat)
+                pred = (probs > 0.5).float()
+                acc = (pred == y).float().mean()
+                total_acc += acc.item() * bs
+
         n += bs
 
-    return {
+    out = {
         "loss": total_loss / max(n, 1),
-        "acc": total_acc / max(n, 1),
-        "joint_acc": total_joint / max(n, 1),
     }
+
+    if task_type == "regression":
+        out["mae"] = total_mae / max(n, 1)
+
+    if task_type == "binary":
+        out["acc"] = total_acc / max(n, 1)
+
+    return out
 
 
 @torch.no_grad()
@@ -198,7 +219,7 @@ class TrainConfig:
     num_workers: int = 0
     seed: int = 42
     save_path: str = "best_model.pt"
-    early_stop_patience: int = 20
+    early_stop_patience: int = 10
     min_delta: float = 1e-4
 
     # IMPORTANT:
@@ -207,10 +228,11 @@ class TrainConfig:
     y_order: Optional[List[str]] = None
 
 
-def run_training_with_loaders(model: nn.Module, train_loader, val_loader, cfg, loss="mse"):
+def run_training_with_loaders(model: nn.Module, train_loader, val_loader, cfg, loss="mse", device=None):
     torch.manual_seed(cfg.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
     optimizer = torch.optim.AdamW(
