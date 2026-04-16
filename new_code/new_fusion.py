@@ -268,7 +268,7 @@ def _window_to_feature(
         )
 
 
-def build_modality_feature_dict(concat_data, modality_keys=None, mode="channel_mean", verbose=True):
+def build_modality_feature_dict(concat_data, modality_keys=None, mode="channel_mean", verbose=True, fs=250):
     """
     Returns
     -------
@@ -306,7 +306,7 @@ def build_modality_feature_dict(concat_data, modality_keys=None, mode="channel_m
             f = _window_to_feature(
                 x,
                 mode=mode,
-                fs=250,
+                fs=fs,
                 bands={
                     "delta": (1, 4),
                     "theta": (4, 8),
@@ -481,6 +481,7 @@ def build_subjectwise_modality_latents(
     pca_dim=10,
     sub_col="sub_id",
     verbose=True,
+    fs=250,
 ):
     """
     Split concat_data by subject, then do feature extraction + PCA within each subject.
@@ -513,6 +514,7 @@ def build_subjectwise_modality_latents(
             modality_keys=modality_keys,
             mode=feature_mode,
             verbose=verbose,
+            fs=fs,
         )
 
         latent_dict = {}
